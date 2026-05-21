@@ -1,0 +1,11 @@
+{
+  "name": "ARCXP Genesis",
+  "description": "ARCXP (AXP) Genesis NFT — a permanent on-chain mark of the early ARC XP network on ARC Testnet.",
+  "image": "ipfs://bafkreicykaqaw4shgr7dxagelki2dte5ghn6wvuyluyfmpzz4kqxdum7du",
+  "external_url": "https://arcxp.lovable.app",
+  "attributes": [
+    { "trait_type": "Collection", "value": "ARCXP" },
+    { "trait_type": "Network", "value": "ARC Testnet" },
+    { "trait_type": "Standard", "value": "ERC-721" }
+  ]
+}

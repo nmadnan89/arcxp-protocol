@@ -1,0 +1,187 @@
+rules_version = '2';
+// ARC XP — Firestore Security Rules
+// Deploy with:  firebase deploy --only firestore:rules
+//
+// Threat model:
+//   - This app writes to Firestore directly from the browser.
+//   - We cannot fully prevent a determined client from awarding itself the
+//     maximum bounded XP, but we CAN:
+//       * block writes from anyone who isn't the owner of the doc
+//       * cap the size of XP/streak changes per write
+//       * forbid clients from setting admin/role flags
+//       * forbid mutating immutable fields (uid, joinedAt, walletAddress reuse)
+//       * forbid client deletes on sensitive collections
+//   - True server-authoritative XP/streak/GM enforcement requires Cloud
+//     Functions or a server route (TanStack server fns) — these rules are the
+//     defense-in-depth layer that protects the existing client logic.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+    function isAdmin() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+    // Set of keys changed in this update (empty on create).
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+    function isNum(v) { return v is int || v is float; }
+
+    // Per-write XP cap. Largest single legit XP action is `video_speaker` = 500.
+    // We allow a small buffer for combined awards but block runaway writes.
+    function pointsDeltaOk() {
+      let prev = resource.data.get('points', 0);
+      let next = request.resource.data.get('points', prev);
+      return isNum(next) && next >= prev && (next - prev) <= 500;
+    }
+    // Streak fields can only stay, +1, or reset to 1.
+    function streakOk(field) {
+      let prev = resource.data.get(field, 0);
+      let next = request.resource.data.get(field, prev);
+      return next == prev || next == prev + 1 || next == 1;
+    }
+    // Fields a client must NEVER set/change on a user doc.
+    function noPrivilegedFields(data) {
+      return !('role' in data)
+          && !('isAdmin' in data)
+          && !('admin' in data)
+          && !('claims' in data);
+    }
+
+    // ---------- users/{uid} ----------
+    match /users/{uid} {
+      // Profiles are publicly readable so leaderboard/profile pages work.
+      // (Remove this if you later move PII into the doc.)
+      allow read: if true;
+
+      // Initial profile creation by the owner.
+      allow create: if isOwner(uid)
+        && request.resource.data.uid == uid
+        && noPrivilegedFields(request.resource.data)
+        && request.resource.data.get('points', 0) <= 50      // signup bonus only
+        && request.resource.data.get('streak', 0) <= 1
+        && request.resource.data.get('gmStreak', 0) <= 1;
+
+      // Owners can update their own profile, with bounded XP/streak deltas.
+      // Admins can update freely (used by the admin console).
+      allow update: if (
+        isOwner(uid)
+        && noPrivilegedFields(request.resource.data)
+        && !changedKeys().hasAny(['uid', 'joinedAt', 'role', 'isAdmin', 'admin', 'claims'])
+        && pointsDeltaOk()
+        && streakOk('streak')
+        && streakOk('gmStreak')
+      ) || isAdmin();
+
+      // No client deletes.
+      allow delete: if isAdmin();
+
+      // ---------- users/{uid}/xpEvents/{eventId} ----------
+      // Ledger entries created by the owner via runTransaction in xp.ts / gm.ts.
+      // Immutable once written; only owner reads.
+      match /xpEvents/{eventId} {
+        allow read: if isOwner(uid) || isAdmin();
+        allow create: if isOwner(uid)
+          && request.resource.data.points is int
+          && request.resource.data.points >= 0
+          && request.resource.data.points <= 500
+          && request.resource.data.action is string;
+        allow update, delete: if isAdmin();
+      }
+    }
+
+    // ---------- events/{eventId} (admin-curated) ----------
+    match /events/{eventId} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+
+      // RSVPs — one doc per user.
+      match /rsvps/{uid} {
+        allow read: if true;
+        allow create, update, delete: if isOwner(uid);
+      }
+
+      // Attendee check-ins — one doc per user.
+      match /attendees/{uid} {
+        allow read: if true;
+        allow create: if isOwner(uid);
+        allow update, delete: if isAdmin();
+      }
+    }
+
+    // ---------- referrals/{invitedUid} ----------
+    // Created when an invited user signs up.
+    //  - the invited user (owner) may set `invitedWallet` and mark the doc
+    //    voided (anti-farming: wallet reuse).
+    //  - the referrer may flip `status` from "pending" to "activated" once
+    //    the invited user's profile satisfies the activation gate (XP /
+    //    wallet / streak). The referrer cannot mutate any other field.
+    match /referrals/{invitedUid} {
+      allow read: if isSignedIn();
+      allow create: if isOwner(invitedUid)
+        && request.resource.data.referrerUid is string
+        && request.resource.data.referrerUid != invitedUid
+        && request.resource.data.invitedUid == invitedUid
+        && (!('status' in request.resource.data)
+            || request.resource.data.status == 'pending');
+      // Invited user can attach their wallet and void on conflict.
+      allow update: if isOwner(invitedUid)
+        && request.resource.data.referrerUid == resource.data.referrerUid
+        && request.resource.data.invitedUid == resource.data.invitedUid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['invitedWallet','status','voidedReason','voidedAt']);
+      // Referrer can flip pending → activated.
+      allow update: if isSignedIn()
+        && request.auth.uid == resource.data.referrerUid
+        && resource.data.status == 'pending'
+        && request.resource.data.status == 'activated'
+        && request.resource.data.referrerUid == resource.data.referrerUid
+        && request.resource.data.invitedUid == resource.data.invitedUid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status','activatedAt']);
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // ---------- feedback/{id} ----------
+    // Any signed-in user can submit feedback; only admins can read/manage.
+    match /feedback/{id} {
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && (request.resource.data.message is string)
+        && request.resource.data.message.size() <= 4000;
+      allow read, update, delete: if isAdmin();
+    }
+
+    // ---------- admins/{uid} ----------
+    // Source of truth for the admin role. Never writable from the client.
+    // Bootstrap the first admin by adding the document from the Firebase
+    // console (Firestore → admins → {your-uid}).
+    match /admins/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow write: if false;
+    }
+
+    // ---------- abuseLogs/{id} ----------
+    // Append-only audit trail written by anti-cheat.ts.
+    match /abuseLogs/{id} {
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid;
+      allow read: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    // ---------- default deny ----------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
